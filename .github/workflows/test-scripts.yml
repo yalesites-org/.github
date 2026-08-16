@@ -1,0 +1,34 @@
+name: Test shared scripts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/test-scripts.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/test-scripts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job runs test files authored by the pull request, so do not
+          # leave a token behind in .git/config for them to read.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run unit tests
+        run: node --test

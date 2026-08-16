@@ -1,0 +1,85 @@
+name: Project status sync
+
+# Reusable workflow that keeps a YaleSites-Internal ticket's Status on the
+# YaleSites Board in step with its pull request, so nobody has to move cards by
+# hand. Called by yalesites-project, atomic and component-library-twig; see
+# docs/project-status-sync.md for how it works and how to add it to a new repo.
+
+on:
+  workflow_call:
+    inputs:
+      project_number:
+        description: The GitHub Projects v2 number of the YaleSites Board.
+        required: false
+        default: 6
+        type: number
+      internal_owner:
+        description: Owner of the repository that holds the tickets.
+        required: false
+        default: yalesites-org
+        type: string
+      internal_repo:
+        description: Repository that holds the tickets.
+        required: false
+        default: YaleSites-Internal
+        type: string
+      dry_run:
+        description: Log what would change without writing to the board.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      PROJECT_TOKEN:
+        description: >-
+          A token with project write scope. Not marked required: without it the
+          workflow warns and exits cleanly rather than failing every merge.
+        required: false
+
+# Only describes GITHUB_TOKEN, which is used for nothing but the checkout below.
+# Every API call is made with PROJECT_TOKEN instead.
+permissions:
+  contents: read
+
+jobs:
+  sync-status:
+    name: Sync ticket status
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for the project token
+        id: token
+        env:
+          # Only ever tested for emptiness; the value is never printed.
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          if [ -z "${PROJECT_TOKEN}" ]; then
+            echo "::warning::PROJECT_TOKEN is not available to ${{ github.repository }}, so the board cannot be updated. See https://github.com/yalesites-org/.github/blob/main/docs/project-status-sync.md"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the shared scripts
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: yalesites-org/.github
+          # A reusable workflow cannot see its own repository, so the scripts it
+          # calls are checked out explicitly. Callers pin this workflow at @main,
+          # so main is the matching ref for the scripts.
+          ref: main
+          path: yalesites-shared
+          persist-credentials: false
+
+      - name: Sync the ticket status
+        if: steps.token.outputs.present == 'true'
+        uses: actions/github-script@v7
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          INTERNAL_OWNER: ${{ inputs.internal_owner }}
+          INTERNAL_REPO: ${{ inputs.internal_repo }}
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const run = require(`${process.env.GITHUB_WORKSPACE}/yalesites-shared/scripts/project-status-sync/sync.js`);
+            await run({ github, context, core });
