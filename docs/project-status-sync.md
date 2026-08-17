@@ -16,19 +16,48 @@ each code repo. That way there is a single place to change it.
 | --- | --- |
 | The **`needs review`** label is added | **In review** |
 | Merged into `develop` | **Ready for Release (in dev)** |
-| Merged into `main`/`master` **in yalesites-project** | **Done** |
+| yalesites-project merges into `master` (the release) | **Done**, for every ticket that shipped — see below |
 
 Nothing else moves a ticket. A pull request that is closed without merging, or
 merged into another feature branch (a stacked PR), is ignored.
 
-### Only yalesites-project marks a ticket Done
+### The release sweep: how tickets reach Done
 
-In atomic and component-library-twig, a merge to `main` is the RC promotion — an
-intermediate release-engineering step, not "shipped" — so tickets stay at *Ready
-for Release (in dev)* until the platform release goes out. That matches what the
-board already records: every ticket carried by the 2026-08-14
-component-library-twig RC (1529, 1532, 1536, 1537) still sits at *Ready for
-Release (in dev)*. The `production_repo` input controls which repo this is.
+Done is not decided from the release pull request's own ticket — a release PR
+carries dozens of tickets and names none of them. Instead, when yalesites-project
+merges to `master`, the workflow sweeps the board:
+
+1. Take every ticket sitting at **Ready for Release (in dev)**. Only that column.
+2. For each, find its pull requests via GitHub's cross-references — our bodies say
+   `References yalesites-org/YaleSites-Internal#1234`, which GitHub records even
+   though it is not a closing keyword.
+3. Keep the **merged** ones that live in a release repo (`release_branches`).
+4. If **every** one of those has reached its repo's production branch
+   (`master` for yalesites-project, `main` for atomic, component-library-twig and
+   tokens), the ticket shipped → **Done**.
+
+Four properties of that rule, each deliberate:
+
+- **A ticket only needs work in the repos it actually touched.** Ticket 1239
+  shipped with only a component-library-twig PR; 1266 with only an atomic PR.
+  Requiring a PR everywhere would strand them.
+- **Every repo it *did* touch must have shipped.** If the
+  component-library-twig half made the RC but the yalesites-project half merged to
+  `develop` afterwards, the ticket is only half out and stays put.
+- **Unmerged pull requests are ignored.** Tickets 1266 and 1311 both have
+  abandoned yalesites-project PRs and shipped anyway.
+- **Only the `release_branches` repos count.** Ticket 1349 is cross-referenced
+  from `yalesites-claude-plugins`, which has no release process; left in, it would
+  hold the ticket open forever.
+
+**A ticket that is not at *Ready for Release (in dev)* is never touched**, even if
+a pull request for it just shipped. Work often lands on a ticket that is
+deliberately still open because more is coming, and completing it would be wrong.
+
+This is why the companion repos' `develop` → `main` RC promotions set nothing on
+their own: an RC is an intermediate release step, not "shipped". The board already
+records it that way — every ticket carried by the 2026-08-14 component-library-twig
+RC (1529, 1532, 1536, 1537) still sits at *Ready for Release (in dev)*.
 
 ### Which repos may use this workflow
 
@@ -62,18 +91,11 @@ This is also why the automation does not fight the manual review labels
 triggers — only `needs review` is — and even if one were re-added late, the
 forward-only rule stops the ticket from regressing.
 
-### Release promotions fan out
-
-yalesites-project ships to `master` from a release branch (`v2115`, `release/*`)
-that carries many tickets rather than one. For those the workflow walks the pull
-requests in the merge range and marks **every** linked ticket **Done**. A hotfix
-branched straight to `master` is not a promotion and is treated as a single
-ticket.
-
-Because only yalesites-project can set Done, the companion repos' `develop` →
-`main` RC Updates never reach this path.
-
 ## How a pull request is matched to a ticket
+
+This applies to the *In review* and *Ready for Release (in dev)* transitions,
+which act on the pull request in front of them. Done goes through the release
+sweep above and uses cross-references instead.
 
 Checked in this order, first match wins:
 
@@ -104,8 +126,8 @@ successfully**. It never fails a run or blocks a merge.
 
 The same holds for API failures. Board bookkeeping is never worth a red X on a
 merge, so any unexpected error is caught and logged as a warning. This matters
-most on a release promotion, which walks hundreds of commits and pull requests: a
-single transient 502 or rate limit would otherwise redden the release PR.
+most on the release sweep, which makes a call per waiting ticket: a single
+transient 502 or rate limit would otherwise redden the release pull request.
 
 ## Setup
 
@@ -180,7 +202,9 @@ All optional; the defaults are what YaleSites uses.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `allowed_repos` | the five YaleSites repos | `owner/repo` per line; anything else is refused |
-| `production_repo` | `yalesites-project` | The only repo whose merge to main/master means Done |
+| `production_repo` | `yalesites-project` | The only repo whose merge to main/master runs the release sweep |
+| `release_branches` | the four code repos | `owner/repo=branch`; the production branch per repo, and the repos the sweep looks at |
+| `project_org` | `yalesites-org` | Organization that owns the board |
 | `project_number` | `6` | The YaleSites Board's Projects v2 number |
 | `internal_owner` | `yalesites-org` | Owner of the repo holding the tickets |
 | `internal_repo` | `YaleSites-Internal` | Repo holding the tickets |

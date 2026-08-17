@@ -16,6 +16,83 @@ function makeCore() {
 }
 
 /**
+ * A github stub for the release sweep.
+ *
+ * `column` is what the board returns for "Ready for Release (in dev)", `pulls`
+ * maps a ticket to its cross-referenced pull requests, and `shipped` is the set
+ * of `repo#number` whose merge commits have reached production.
+ */
+function makeSweepGithub({ column = [], pulls = {}, shipped = new Set() } = {}) {
+  const github = {
+    mutations: [],
+    compares: [],
+    graphql: async (query, variables) => {
+      if (query.includes('updateProjectV2ItemFieldValue')) {
+        github.mutations.push(variables);
+        return {};
+      }
+
+      if (query.includes('projectV2(number: $number)')) {
+        return {
+          organization: {
+            projectV2: {
+              id: 'PROJECT_1',
+              field: {
+                id: 'FIELD_1',
+                options: [
+                  { id: 'opt-ready', name: 'Ready for Release (in dev)' },
+                  { id: 'opt-done', name: 'Done' },
+                ],
+              },
+              items: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: column,
+              },
+            },
+          },
+        };
+      }
+
+      if (query.includes('CROSS_REFERENCED_EVENT')) {
+        const nodes = (pulls[variables.number] || []).map((pull) => ({ source: pull }));
+        return { repository: { issue: { timelineItems: { nodes } } } };
+      }
+
+      throw new Error(`unexpected query: ${query.slice(0, 60)}`);
+    },
+    rest: {
+      repos: {
+        compareCommitsWithBasehead: async ({ owner, repo, basehead }) => {
+          github.compares.push(`${owner}/${repo} ${basehead}`);
+          const sha = basehead.split('...')[1];
+          return { data: { ahead_by: shipped.has(sha) ? 0 : 3 } };
+        },
+      },
+    },
+  };
+  return github;
+}
+
+/** A board item at "Ready for Release (in dev)" for `ticket`. */
+function readyItem(ticket) {
+  return {
+    id: `ITEM_${ticket}`,
+    fieldValueByName: { name: 'Ready for Release (in dev)' },
+    content: { number: ticket, repository: { nameWithOwner: 'yalesites-org/YaleSites-Internal' } },
+  };
+}
+
+/** A merged cross-referenced pull request. */
+function mergedPull(repository, number, sha) {
+  return {
+    number,
+    merged: true,
+    mergeCommit: { oid: sha },
+    repository: { nameWithOwner: repository },
+  };
+}
+
+/**
  * A github stub that records GraphQL calls and answers the issue lookup with a
  * single board item at `currentStatus`.
  */
@@ -92,6 +169,19 @@ function makePullRequest(overrides = {}) {
   };
 }
 
+/** The platform release: yalesites-project v2260 -> master. */
+function releaseContext() {
+  return makeContext({
+    action: 'closed',
+    pullRequest: makePullRequest({
+      title: 'Release v2.26.0',
+      body: '',
+      base: { ref: 'master', sha: 'basesha' },
+      head: { ref: 'v2260' },
+    }),
+  });
+}
+
 describe('sync', () => {
   beforeEach(() => {
     process.env.INTERNAL_OWNER = 'yalesites-org';
@@ -99,6 +189,13 @@ describe('sync', () => {
     process.env.PROJECT_NUMBER = String(PROJECT_NUMBER);
     process.env.PRODUCTION_REPO = 'yalesites-project';
     process.env.ALLOWED_REPOS = 'yalesites-org/yalesites-project\nyalesites-org/atomic';
+    process.env.PROJECT_ORG = 'yalesites-org';
+    process.env.RELEASE_BRANCHES = [
+      'yalesites-org/yalesites-project=master',
+      'yalesites-org/atomic=main',
+      'yalesites-org/component-library-twig=main',
+      'yalesites-org/tokens=main',
+    ].join('\n');
     process.env.DRY_RUN = 'false';
   });
 
@@ -199,7 +296,7 @@ describe('sync', () => {
         pullRequest: makePullRequest({
           title: '',
           body: '',
-          base: { ref: 'master', sha: 'basesha' },
+          base: { ref: 'develop', sha: 'basesha' },
           head: { ref: '99999-a-number-that-is-not-a-ticket' },
         }),
       }),
@@ -237,67 +334,6 @@ describe('sync', () => {
     assert.ok(core.infos.some((message) => message.startsWith('[dry run]')));
   });
 
-  it('marks every ticket in a release promotion Done', async () => {
-    const github = makeGithub({ currentStatus: 'Ready for Release (in dev)' });
-    github.paginate = async () => [
-      { commit: { message: 'Merge pull request #1469 from yalesites-org/1550-beacon-soft-cap' } },
-      { commit: { message: 'Merge pull request #1471 from yalesites-org/bump-atomic-1810' } },
-    ];
-    github.rest = {
-      pulls: {
-        get: async (_options) => ({
-          data: { head: { ref: '1550-beacon-soft-cap' }, title: '1550: Beacon', body: '' },
-        }),
-      },
-      repos: { compareCommits: () => {} },
-    };
-    const core = makeCore();
-
-    await run({
-      github,
-      core,
-      context: makeContext({
-        action: 'closed',
-        pullRequest: makePullRequest({
-          title: 'RC Update',
-          body: '',
-          base: { ref: 'main', sha: 'basesha' },
-          head: { ref: 'develop' },
-        }),
-      }),
-    });
-
-    assert.equal(github.mutations.length, 1);
-    assert.equal(github.mutations[0].optionId, 'opt-done');
-  });
-
-  it('never lets a failure escape and fail the workflow run', async () => {
-    // The release fan-out makes hundreds of sequential API calls, so a single
-    // transient error must not put a red X on a release pull request.
-    const github = makeGithub();
-    github.paginate = async () => {
-      throw new Error('502 Bad Gateway');
-    };
-    github.rest = { repos: { compareCommits: () => {} } };
-    const core = makeCore();
-
-    await run({
-      github,
-      core,
-      context: makeContext({
-        action: 'closed',
-        pullRequest: makePullRequest({
-          title: 'RC Update',
-          body: '',
-          base: { ref: 'main', sha: 'basesha' },
-          head: { ref: 'develop' },
-        }),
-      }),
-    });
-
-    assert.match(core.warnings[0], /did not complete: 502 Bad Gateway/);
-  });
-
   it('keeps going when one ticket update throws', async () => {
     const github = makeGithub();
     github.graphql = async () => {
@@ -308,5 +344,173 @@ describe('sync', () => {
     await run({ github, core, context: makeContext({ action: 'closed', pullRequest: makePullRequest() }) });
 
     assert.match(core.warnings[0], /Could not update #1550: boom/);
+  });
+
+  it('marks a ticket Done when every merged PR has reached production', async () => {
+    const github = makeSweepGithub({
+      column: [readyItem(1239)],
+      pulls: { 1239: [mergedPull('yalesites-org/component-library-twig', 647, 'clt-sha')] },
+      shipped: new Set(['clt-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 1);
+    assert.equal(github.mutations[0].optionId, 'opt-done');
+    assert.equal(github.mutations[0].itemId, 'ITEM_1239');
+  });
+
+  it('marks a companion-only ticket Done - the gap this sweep exists to close', async () => {
+    // Ticket 1266 shipped in v2.23.0 with only an atomic PR. The old commit-range
+    // fan-out walked yalesites-project only, so it never saw this ticket and a
+    // human had to move it by hand.
+    const github = makeSweepGithub({
+      column: [readyItem(1266)],
+      pulls: { 1266: [mergedPull('yalesites-org/atomic', 463, 'atomic-sha')] },
+      shipped: new Set(['atomic-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 1);
+    assert.equal(github.compares[0], 'yalesites-org/atomic main...atomic-sha');
+  });
+
+  it('leaves a ticket alone when one of its repos has not shipped yet', async () => {
+    // The CLT half made the RC but the yalesites-project half merged to develop
+    // afterwards, so the ticket is only half shipped.
+    const github = makeSweepGithub({
+      column: [readyItem(1299)],
+      pulls: {
+        1299: [
+          mergedPull('yalesites-org/component-library-twig', 648, 'clt-sha'),
+          mergedPull('yalesites-org/yalesites-project', 1295, 'ysp-sha'),
+        ],
+      },
+      shipped: new Set(['clt-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 0);
+  });
+
+  it('ignores unmerged pull requests', async () => {
+    // Tickets 1266 and 1311 both have abandoned yalesites-project PRs and
+    // shipped anyway, so an unmerged PR must not hold a ticket open.
+    const github = makeSweepGithub({
+      column: [readyItem(1311)],
+      pulls: {
+        1311: [
+          mergedPull('yalesites-org/atomic', 465, 'atomic-sha'),
+          { number: 1297, merged: false, mergeCommit: null, repository: { nameWithOwner: 'yalesites-org/yalesites-project' } },
+        ],
+      },
+      shipped: new Set(['atomic-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 1);
+    assert.equal(github.mutations[0].optionId, 'opt-done');
+  });
+
+  it('ignores references from repos with no release process', async () => {
+    // Ticket 1349 is cross-referenced from yalesites-claude-plugins, which never
+    // promotes to a release branch. It must not gate the ticket.
+    const github = makeSweepGithub({
+      column: [readyItem(1349)],
+      pulls: {
+        1349: [
+          mergedPull('yalesites-org/atomic', 470, 'atomic-sha'),
+          mergedPull('yalesites-org/yalesites-claude-plugins', 6, 'plugins-sha'),
+        ],
+      },
+      shipped: new Set(['atomic-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 1);
+    assert.deepEqual(github.compares, ['yalesites-org/atomic main...atomic-sha']);
+  });
+
+  it('only considers tickets already at Ready for Release', async () => {
+    // Work can be merged on a ticket that is deliberately still open because
+    // more is coming. A shipped pull request must not complete it.
+    const inProgress = {
+      id: 'ITEM_9999',
+      fieldValueByName: { name: 'In progress' },
+      content: { number: 9999, repository: { nameWithOwner: 'yalesites-org/YaleSites-Internal' } },
+    };
+    const github = makeSweepGithub({
+      column: [inProgress],
+      pulls: { 9999: [mergedPull('yalesites-org/atomic', 1, 'atomic-sha')] },
+      shipped: new Set(['atomic-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 0);
+    assert.equal(github.compares.length, 0);
+  });
+
+  it('skips a ticket with no merged pull request in any release repo', async () => {
+    const github = makeSweepGithub({ column: [readyItem(1500)], pulls: {} });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 0);
+    assert.ok(core.infos.some((m) => m.includes('no merged pull request in a release repo')));
+  });
+
+  it('treats an unresolvable comparison as not shipped rather than failing', async () => {
+    const github = makeSweepGithub({
+      column: [readyItem(1266)],
+      pulls: { 1266: [mergedPull('yalesites-org/atomic', 463, 'gone-sha')] },
+    });
+    github.rest.repos.compareCommitsWithBasehead = async () => {
+      throw new Error('Not Found');
+    };
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 0);
+    assert.match(core.warnings[0], /Could not tell whether/);
+  });
+
+  it('changes nothing on a release in dry run mode', async () => {
+    process.env.DRY_RUN = 'true';
+    const github = makeSweepGithub({
+      column: [readyItem(1239)],
+      pulls: { 1239: [mergedPull('yalesites-org/component-library-twig', 647, 'clt-sha')] },
+      shipped: new Set(['clt-sha']),
+    });
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.equal(github.mutations.length, 0);
+    assert.ok(core.infos.some((m) => m.startsWith('[dry run]')));
+  });
+
+  it('never lets a failure escape and fail the release', async () => {
+    const github = makeSweepGithub({ column: [readyItem(1239)] });
+    github.graphql = async () => {
+      throw new Error('502 Bad Gateway');
+    };
+    const core = makeCore();
+
+    await run({ github, core, context: releaseContext() });
+
+    assert.match(core.warnings[0], /did not complete: 502 Bad Gateway/);
   });
 });

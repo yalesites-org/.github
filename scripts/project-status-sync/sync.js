@@ -8,10 +8,11 @@
 
 const {
   STATUS_DONE,
-  extractMergedPullNumbers,
+  STATUS_READY_FOR_RELEASE,
   isAllowedCaller,
+  isContainedInProduction,
   isMissingRecordError,
-  isReleasePromotion,
+  parseReleaseBranches,
   resolveTargetStatus,
   resolveTicketNumber,
   shouldApplyStatus,
@@ -45,6 +46,73 @@ const ISSUE_PROJECT_STATUS_QUERY = `
   }
 `;
 
+/**
+ * Every ticket sitting in one column of the board, with its project item ids so
+ * the status can be written back without a second lookup.
+ */
+const BOARD_COLUMN_QUERY = `
+  query($org: String!, $number: Int!, $cursor: String) {
+    organization(login: $org) {
+      projectV2(number: $number) {
+        id
+        field(name: "Status") {
+          ... on ProjectV2SingleSelectField {
+            id
+            options { id name }
+          }
+        }
+        items(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            fieldValueByName(name: "Status") {
+              ... on ProjectV2ItemFieldSingleSelectValue { name }
+            }
+            content {
+              ... on Issue {
+                number
+                repository { nameWithOwner }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/**
+ * The pull requests that reference a ticket, in any repo.
+ *
+ * Our PR bodies carry `References yalesites-org/YaleSites-Internal#1234`, which
+ * GitHub records as a cross-reference even though it is not a closing keyword.
+ * That makes this more reliable than re-parsing branch names: ticket 1265's pull
+ * request branch was `drupal-10-6-10-update`, with no ticket number in it at
+ * all, and the cross-reference still finds it.
+ */
+const TICKET_PULL_REQUESTS_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      issue(number: $number) {
+        timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: 100) {
+          nodes {
+            ... on CrossReferencedEvent {
+              source {
+                ... on PullRequest {
+                  number
+                  merged
+                  mergeCommit { oid }
+                  repository { nameWithOwner }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const SET_STATUS_MUTATION = `
   mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
     updateProjectV2ItemFieldValue(input: {
@@ -58,47 +126,173 @@ const SET_STATUS_MUTATION = `
   }
 `;
 
-/**
- * Collects the tickets a merged release promotion carries, by walking the pull
- * requests it brought along.
- */
-async function resolveTicketsFromReleasePromotion({ github, core, pullRequest }) {
-  const { owner, repo } = pullRequest.repository;
+/** Every board item currently sitting in one column, plus the ids to write with. */
+async function fetchColumn({ github, options, status }) {
+  const { org, projectNumber } = options;
+  const items = [];
+  let project = null;
+  let cursor = null;
 
-  const commits = await github.paginate(
-    github.rest.repos.compareCommits,
-    {
-      owner,
-      repo,
-      base: pullRequest.baseSha,
-      head: pullRequest.mergeCommitSha,
-      per_page: 100,
-    },
-    (response) => response.data.commits,
-  );
-
-  const pullNumbers = extractMergedPullNumbers(commits.map((commit) => commit.commit.message));
-  core.info(`Release promotion carries ${commits.length} commits across ${pullNumbers.length} pull requests.`);
-
-  const tickets = new Map();
-
-  for (const pullNumber of pullNumbers) {
-    const { data } = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-    const ticket = resolveTicketNumber({
-      headRef: data.head.ref,
-      title: data.title,
-      body: data.body,
+  do {
+    const result = await github.graphql(BOARD_COLUMN_QUERY, {
+      org,
+      number: projectNumber,
+      cursor,
     });
 
-    if (ticket) {
-      tickets.set(ticket, pullNumber);
-      core.info(`  #${pullNumber} -> ticket ${ticket}`);
-    } else {
-      core.info(`  #${pullNumber} (${data.title}) has no linked ticket - skipping`);
+    project = result.organization.projectV2;
+    for (const item of project.items.nodes) {
+      const current = item.fieldValueByName ? item.fieldValueByName.name : null;
+      if (current && current.toLowerCase() === status.toLowerCase() && item.content) {
+        items.push(item);
+      }
     }
+
+    cursor = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
+  } while (cursor);
+
+  return { project, items };
+}
+
+/** The merged pull requests referencing a ticket, limited to the release repos. */
+async function fetchShippablePullRequests({ github, options, ticket }) {
+  const { internalOwner, internalRepo, releaseBranches } = options;
+
+  const result = await github.graphql(TICKET_PULL_REQUESTS_QUERY, {
+    owner: internalOwner,
+    repo: internalRepo,
+    number: ticket,
+  });
+
+  const seen = new Set();
+  const pullRequests = [];
+
+  for (const node of result.repository.issue.timelineItems.nodes) {
+    const pull = node.source;
+    if (!pull || !pull.merged || !pull.mergeCommit) {
+      continue;
+    }
+
+    const repository = pull.repository.nameWithOwner;
+    const key = `${repository}#${pull.number}`;
+    if (seen.has(key) || !releaseBranches.has(repository.toLowerCase())) {
+      continue;
+    }
+
+    seen.add(key);
+    pullRequests.push({ repository, number: pull.number, sha: pull.mergeCommit.oid });
   }
 
-  return [...tickets.keys()];
+  return pullRequests;
+}
+
+/** Whether a merge commit has reached its repo's production branch. */
+async function hasShipped({ github, core, options, pull }) {
+  const [owner, repo] = pull.repository.split('/');
+  const branch = options.releaseBranches.get(pull.repository.toLowerCase());
+
+  try {
+    const { data } = await github.rest.repos.compareCommitsWithBasehead({
+      owner,
+      repo,
+      basehead: `${branch}...${pull.sha}`,
+    });
+    return isContainedInProduction({ aheadBy: data.ahead_by });
+  } catch (error) {
+    // A merge commit can vanish if its branch was deleted and garbage collected.
+    // Treat that as "not shipped" rather than aborting the whole sweep.
+    core.warning(
+      `Could not tell whether ${pull.repository}#${pull.number} is in ${branch}: ${error.message}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Marks every ticket whose work has reached production as Done.
+ *
+ * Runs when the platform repo releases. Only tickets already sitting at "Ready
+ * for Release (in dev)" are considered: a ticket still In progress or In review
+ * has more work to come, so a shipped pull request must not complete it.
+ *
+ * A ticket ships when every merged pull request it has *in a release repo* is
+ * contained in that repo's production branch. Requiring every one of them —
+ * rather than any — is what stops a ticket being called Done when its
+ * component-library-twig half made the RC but its yalesites-project half merged
+ * to develop afterwards. Unmerged pull requests are ignored: tickets 1266 and
+ * 1311 both have abandoned yalesites-project pull requests and shipped anyway.
+ */
+async function markShippedTicketsDone({ github, core, options }) {
+  const { project, items } = await fetchColumn({
+    github,
+    options,
+    status: STATUS_READY_FOR_RELEASE,
+  });
+
+  core.info(`${items.length} ticket(s) sitting at "${STATUS_READY_FOR_RELEASE}".`);
+
+  for (const item of items) {
+    const ticket = item.content.number;
+    const pullRequests = await fetchShippablePullRequests({ github, options, ticket });
+
+    if (pullRequests.length === 0) {
+      core.info(`#${ticket}: no merged pull request in a release repo - leaving it alone.`);
+      continue;
+    }
+
+    const shipped = [];
+    for (const pull of pullRequests) {
+      if (!(await hasShipped({ github, core, options, pull }))) {
+        core.info(
+          `#${ticket}: ${pull.repository}#${pull.number} has not reached production yet - ` +
+            'leaving the ticket at Ready for Release.',
+        );
+        shipped.length = 0;
+        break;
+      }
+      shipped.push(`${pull.repository}#${pull.number}`);
+    }
+
+    if (shipped.length === 0) {
+      continue;
+    }
+
+    await setItemStatus({
+      github,
+      core,
+      project,
+      item,
+      targetStatus: STATUS_DONE,
+      options,
+      reason: shipped.join(', '),
+    });
+  }
+}
+
+/** Writes a status onto a board item we already hold the ids for. */
+async function setItemStatus({ github, core, project, item, targetStatus, options, reason }) {
+  const ticket = item.content.number;
+  const option = project.field.options.find(
+    (candidate) => candidate.name.toLowerCase() === targetStatus.toLowerCase(),
+  );
+
+  if (!option) {
+    core.warning(`The board has no "${targetStatus}" Status option. Skipping #${ticket}.`);
+    return;
+  }
+
+  if (options.dryRun) {
+    core.info(`[dry run] Would set #${ticket} to "${targetStatus}" (shipped in ${reason}).`);
+    return;
+  }
+
+  await github.graphql(SET_STATUS_MUTATION, {
+    projectId: project.id,
+    itemId: item.id,
+    fieldId: project.field.id,
+    optionId: option.id,
+  });
+  core.info(`Set #${ticket} to "${targetStatus}" (shipped in ${reason}).`);
 }
 
 /**
@@ -182,10 +376,12 @@ async function applyStatusToTicket({ github, core, ticket, targetStatus, options
 /** Works out which tickets this event affects and moves each one. */
 async function sync({ github, context, core }) {
   const options = {
+    org: process.env.PROJECT_ORG,
     internalOwner: process.env.INTERNAL_OWNER,
     internalRepo: process.env.INTERNAL_REPO,
     projectNumber: Number(process.env.PROJECT_NUMBER),
     productionRepo: process.env.PRODUCTION_REPO,
+    releaseBranches: parseReleaseBranches(process.env.RELEASE_BRANCHES),
     dryRun: process.env.DRY_RUN === 'true',
   };
 
@@ -223,24 +419,23 @@ async function sync({ github, context, core }) {
 
   core.info(`Target status: "${targetStatus}"${options.dryRun ? ' (dry run)' : ''}`);
 
-  const pullRequest = {
-    repository: context.repo,
-    baseSha: payload.base.sha,
-    mergeCommitSha: payload.merge_commit_sha,
-  };
-
-  let tickets;
-  if (targetStatus === STATUS_DONE && isReleasePromotion(payload.head.ref)) {
-    core.info(`"${payload.head.ref}" is a release promotion - collecting every ticket it carries.`);
-    tickets = await resolveTicketsFromReleasePromotion({ github, core, pullRequest });
-  } else {
-    const ticket = resolveTicketNumber({
-      headRef: payload.head.ref,
-      title: payload.title,
-      body: payload.body,
-    });
-    tickets = ticket ? [ticket] : [];
+  // The platform release is not about the release pull request's own ticket - it
+  // ships everything waiting in the dev column, across all four repos. Sweep the
+  // board instead of trying to read tickets out of this one pull request.
+  if (targetStatus === STATUS_DONE) {
+    core.info(
+      `${repository} released to "${payload.base.ref}" - marking every shipped ticket Done.`,
+    );
+    await markShippedTicketsDone({ github, core, options });
+    return;
   }
+
+  const ticket = resolveTicketNumber({
+    headRef: payload.head.ref,
+    title: payload.title,
+    body: payload.body,
+  });
+  const tickets = ticket ? [ticket] : [];
 
   if (tickets.length === 0) {
     core.warning(

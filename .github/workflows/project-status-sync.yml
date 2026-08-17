@@ -8,6 +8,11 @@ name: Project status sync
 on:
   workflow_call:
     inputs:
+      project_org:
+        description: Organization that owns the YaleSites Board.
+        required: false
+        default: yalesites-org
+        type: string
       project_number:
         description: The GitHub Projects v2 number of the YaleSites Board.
         required: false
@@ -43,6 +48,20 @@ on:
           promotion, so their tickets stay at Ready for Release (in dev).
         required: false
         default: yalesites-project
+        type: string
+      release_branches:
+        description: >-
+          `owner/repo=branch` per line, naming each repo's production branch.
+          On a release, a ticket is marked Done only once every merged pull
+          request it has in these repos has reached that repo's branch. Doubles
+          as the list of repos the release sweep looks at, so a stray reference
+          from an unrelated repo cannot hold a ticket open.
+        required: false
+        default: |
+          yalesites-org/yalesites-project=master
+          yalesites-org/atomic=main
+          yalesites-org/component-library-twig=main
+          yalesites-org/tokens=main
         type: string
       dry_run:
         description: Log what would change without writing to the board.
@@ -100,7 +119,9 @@ jobs:
           INTERNAL_OWNER: ${{ inputs.internal_owner }}
           INTERNAL_REPO: ${{ inputs.internal_repo }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
+          PROJECT_ORG: ${{ inputs.project_org }}
           PRODUCTION_REPO: ${{ inputs.production_repo }}
+          RELEASE_BRANCHES: ${{ inputs.release_branches }}
         with:
           github-token: ${{ secrets.PROJECT_TOKEN }}
           script: |

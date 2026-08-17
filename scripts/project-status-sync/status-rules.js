@@ -30,14 +30,6 @@ const STATUS_ORDER = [
 ];
 
 /**
- * Head branch names that promote a batch of already-merged work to production
- * rather than carrying a single ticket: `develop` (atomic and
- * component-library-twig RC updates), `v2115` and `release/2.24.0`
- * (yalesites-project releases).
- */
-const RELEASE_PROMOTION_PATTERNS = [/^develop$/, /^v\d[\d.]*$/, /^release[/-]/i];
-
-/**
  * Ways a pull request can name its YaleSites-Internal ticket, most reliable
  * first. The branch name wins because `{issue-number}-{description}` is the
  * convention every YaleSites branch follows; the `References ...` body line is
@@ -59,8 +51,6 @@ const TICKET_PATTERNS = [
   // completely unrelated ticket. No YaleSites pull request uses that form.
   { field: 'body', pattern: /YaleSites-Internal#(\d+)/i },
 ];
-
-const PULL_NUMBER_PATTERNS = [/^Merge pull request #(\d+)\b/, /\(#(\d+)\)\s*$/];
 
 /**
  * Finds the YaleSites-Internal ticket a pull request belongs to.
@@ -135,36 +125,46 @@ function isAllowedCaller(repository, allowed) {
 }
 
 /**
- * Whether a head branch promotes a batch of merged work rather than one ticket.
+ * Reads the `owner/repo=branch` map naming each repo's production branch.
  *
- * @param {string} headRef
- * @returns {boolean}
- */
-function isReleasePromotion(headRef) {
-  return RELEASE_PROMOTION_PATTERNS.some((pattern) => pattern.test(headRef || ''));
-}
-
-/**
- * Pulls the pull request numbers out of a list of commit messages.
+ * Doubles as the list of repos the release sweep pays attention to. A ticket's
+ * cross-references can reach repos with no release process at all — ticket 1349
+ * is referenced from `yalesites-org/yalesites-claude-plugins` — and those must
+ * not gate whether a ticket has shipped.
  *
- * @param {string[]} commitMessages
- * @returns {number[]} Unique pull request numbers, in the order encountered.
+ * @param {string} text One `owner/repo=branch` per line (or comma separated).
+ * @returns {Map<string, string>} Lower-cased `owner/repo` to branch name.
  */
-function extractMergedPullNumbers(commitMessages) {
-  const numbers = new Set();
+function parseReleaseBranches(text) {
+  const branches = new Map();
 
-  for (const message of commitMessages || []) {
-    const subject = String(message).split('\n')[0];
-    for (const pattern of PULL_NUMBER_PATTERNS) {
-      const match = subject.match(pattern);
-      if (match) {
-        numbers.add(Number(match[1]));
-        break;
-      }
+  for (const entry of String(text || '').split(/[\n,]/)) {
+    const [repository, branch] = entry.split('=');
+    if (repository && branch && repository.trim() && branch.trim()) {
+      branches.set(repository.trim().toLowerCase(), branch.trim());
     }
   }
 
-  return [...numbers];
+  return branches;
+}
+
+/**
+ * Whether a commit has reached a repo's production branch.
+ *
+ * Reads the result of comparing `productionBranch...mergeCommit`. GitHub reports
+ * four statuses, and `ahead_by` collapses them into the only question that
+ * matters — are there commits in the merge commit that production does not have?
+ *
+ *   identical -> ahead_by 0, contained (production is exactly this commit)
+ *   behind    -> ahead_by 0, contained (production has moved on since)
+ *   ahead     -> ahead_by > 0, NOT contained
+ *   diverged  -> ahead_by > 0, NOT contained (merged to develop after the RC cut)
+ *
+ * @param {{aheadBy?: number}} comparison
+ * @returns {boolean}
+ */
+function isContainedInProduction({ aheadBy } = {}) {
+  return aheadBy === 0;
 }
 
 /**
@@ -208,10 +208,10 @@ module.exports = {
   STATUS_DONE,
   STATUS_IN_REVIEW,
   STATUS_READY_FOR_RELEASE,
-  extractMergedPullNumbers,
   isAllowedCaller,
+  isContainedInProduction,
   isMissingRecordError,
-  isReleasePromotion,
+  parseReleaseBranches,
   resolveTargetStatus,
   resolveTicketNumber,
   shouldApplyStatus,

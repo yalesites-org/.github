@@ -5,10 +5,10 @@ const {
   STATUS_DONE,
   STATUS_IN_REVIEW,
   STATUS_READY_FOR_RELEASE,
-  extractMergedPullNumbers,
   isAllowedCaller,
+  isContainedInProduction,
   isMissingRecordError,
-  isReleasePromotion,
+  parseReleaseBranches,
   resolveTargetStatus,
   resolveTicketNumber,
   shouldApplyStatus,
@@ -223,52 +223,6 @@ describe('isAllowedCaller', () => {
   });
 });
 
-describe('isReleasePromotion', () => {
-  it('recognises the develop to main promotion used by atomic and component-library-twig', () => {
-    assert.equal(isReleasePromotion('develop'), true);
-  });
-
-  it('recognises a versioned release branch', () => {
-    assert.equal(isReleasePromotion('v2115'), true);
-    assert.equal(isReleasePromotion('release/2.24.0'), true);
-  });
-
-  it('does not treat a hotfix branch as a release promotion', () => {
-    assert.equal(isReleasePromotion('hotfix/2230-hotfix-1'), false);
-    assert.equal(isReleasePromotion('1550-beacon-soft-cap-instructions'), false);
-  });
-});
-
-describe('extractMergedPullNumbers', () => {
-  it('reads pull request numbers from merge commit subjects', () => {
-    const numbers = extractMergedPullNumbers([
-      'Merge pull request #1471 from yalesites-org/bump-atomic-1810\n\nfeat: update atomic',
-      'feat: update atomic to v1.81.0',
-      'Merge pull request #1462 from yalesites-org/1526-resources-csv-import',
-    ]);
-    assert.deepEqual(numbers, [1471, 1462]);
-  });
-
-  it('reads pull request numbers from squash commit subjects', () => {
-    assert.deepEqual(extractMergedPullNumbers(['fix: correct the thing (#688)']), [688]);
-  });
-
-  it('de-duplicates and ignores commits with no pull request reference', () => {
-    assert.deepEqual(
-      extractMergedPullNumbers([
-        'Merge pull request #10 from a/b',
-        'Merge pull request #10 from a/b',
-        'chore: no reference here',
-      ]),
-      [10],
-    );
-  });
-
-  it('returns an empty list for no commits', () => {
-    assert.deepEqual(extractMergedPullNumbers([]), []);
-  });
-});
-
 describe('isMissingRecordError', () => {
   // Shape observed from the real API for a number that is not an issue:
   // {"data":{"repository":{"issue":null}},"errors":[{"type":"NOT_FOUND",...}]}
@@ -320,5 +274,58 @@ describe('shouldApplyStatus', () => {
 
   it('compares status names case-insensitively', () => {
     assert.equal(shouldApplyStatus('done', STATUS_IN_REVIEW), false);
+  });
+});
+
+describe('parseReleaseBranches', () => {
+  const text = [
+    'yalesites-org/yalesites-project=master',
+    'yalesites-org/atomic=main',
+    'yalesites-org/component-library-twig=main',
+    'yalesites-org/tokens=main',
+  ].join('\n');
+
+  it('maps each repo to its production branch', () => {
+    const branches = parseReleaseBranches(text);
+    assert.equal(branches.get('yalesites-org/yalesites-project'), 'master');
+    assert.equal(branches.get('yalesites-org/atomic'), 'main');
+    assert.equal(branches.get('yalesites-org/tokens'), 'main');
+    assert.equal(branches.size, 4);
+  });
+
+  it('excludes repos with no release process', () => {
+    // Ticket 1349 is cross-referenced from yalesites-claude-plugins, which has
+    // no RC promotion. It must not gate whether the ticket has shipped.
+    assert.equal(parseReleaseBranches(text).has('yalesites-org/yalesites-claude-plugins'), false);
+  });
+
+  it('ignores blank and malformed lines', () => {
+    const branches = parseReleaseBranches('\n\nyalesites-org/atomic=main\ngarbage\nx=\n=y\n');
+    assert.equal(branches.size, 1);
+    assert.equal(branches.get('yalesites-org/atomic'), 'main');
+  });
+
+  it('returns an empty map for missing configuration', () => {
+    assert.equal(parseReleaseBranches(undefined).size, 0);
+  });
+});
+
+describe('isContainedInProduction', () => {
+  // Verified live against the real API. Comparing productionBranch...mergeCommit:
+  //   atomic main...a1b8d69 (ticket 1266, shipped)     -> behind,    ahead_by 0
+  //   atomic main...<main tip>                          -> identical, ahead_by 0
+  //   CLT    main...caaf2e6 (ticket 1554, post-RC)      -> diverged,  ahead_by 2
+  it('treats behind as shipped', () => {
+    assert.equal(isContainedInProduction({ aheadBy: 0 }), true);
+  });
+
+  it('treats a commit production does not have as not shipped', () => {
+    assert.equal(isContainedInProduction({ aheadBy: 2 }), false);
+    assert.equal(isContainedInProduction({ aheadBy: 1 }), false);
+  });
+
+  it('is false when the comparison could not be made', () => {
+    assert.equal(isContainedInProduction({}), false);
+    assert.equal(isContainedInProduction(), false);
   });
 });
