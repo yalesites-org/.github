@@ -9,6 +9,7 @@
 const {
   STATUS_DONE,
   extractMergedPullNumbers,
+  isAllowedCaller,
   isMissingRecordError,
   isReleasePromotion,
   resolveTargetStatus,
@@ -184,8 +185,18 @@ async function sync({ github, context, core }) {
     internalOwner: process.env.INTERNAL_OWNER,
     internalRepo: process.env.INTERNAL_REPO,
     projectNumber: Number(process.env.PROJECT_NUMBER),
+    productionRepo: process.env.PRODUCTION_REPO,
     dryRun: process.env.DRY_RUN === 'true',
   };
+
+  const repository = `${context.repo.owner}/${context.repo.repo}`;
+  if (!isAllowedCaller(repository, process.env.ALLOWED_REPOS)) {
+    core.warning(
+      `${repository} is not on this workflow's allow list, so it may not change the board. ` +
+        'Add it to the allowed_repos input if that is wrong.',
+    );
+    return;
+  }
 
   const payload = context.payload.pull_request;
   if (!payload) {
@@ -198,6 +209,8 @@ async function sync({ github, context, core }) {
     labelName: context.payload.label ? context.payload.label.name : null,
     merged: payload.merged,
     baseRef: payload.base.ref,
+    repo: context.repo.repo,
+    productionRepo: options.productionRepo,
   });
 
   if (!targetStatus) {

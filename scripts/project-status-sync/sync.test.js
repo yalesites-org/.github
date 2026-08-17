@@ -97,7 +97,27 @@ describe('sync', () => {
     process.env.INTERNAL_OWNER = 'yalesites-org';
     process.env.INTERNAL_REPO = 'YaleSites-Internal';
     process.env.PROJECT_NUMBER = String(PROJECT_NUMBER);
+    process.env.PRODUCTION_REPO = 'yalesites-project';
+    process.env.ALLOWED_REPOS = 'yalesites-org/yalesites-project\nyalesites-org/atomic';
     process.env.DRY_RUN = 'false';
+  });
+
+  it('refuses to touch the board for a repo that is not on the allow list', async () => {
+    // The reusable workflow lives in a public repo, so any repo on GitHub can
+    // call it. Without this guard only the org secret's visibility setting
+    // would stand between an unrelated repo and the board.
+    process.env.ALLOWED_REPOS = 'yalesites-org/atomic';
+    const github = makeGithub();
+    const core = makeCore();
+
+    await run({
+      github,
+      core,
+      context: makeContext({ action: 'closed', pullRequest: makePullRequest() }),
+    });
+
+    assert.equal(github.mutations.length, 0);
+    assert.match(core.warnings[0], /not on this workflow's allow list/);
   });
 
   it('sets Ready for Release when a ticketed PR merges to develop', async () => {

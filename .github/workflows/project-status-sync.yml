@@ -23,6 +23,27 @@ on:
         required: false
         default: YaleSites-Internal
         type: string
+      allowed_repos:
+        description: >-
+          Repositories whose pull requests may move tickets, one `owner/repo`
+          per line. This workflow is in a public repo, so GitHub lets any
+          repository call it; this is what keeps it to the YaleSites code repos.
+        required: false
+        default: |
+          yalesites-org/yalesites-project
+          yalesites-org/atomic
+          yalesites-org/component-library-twig
+          yalesites-org/tokens
+          yalesites-org/YaleSites-Internal
+        type: string
+      production_repo:
+        description: >-
+          The repo whose merge to main/master means "shipped". Only that repo
+          marks tickets Done; in the companion repos a merge to main is an RC
+          promotion, so their tickets stay at Ready for Release (in dev).
+        required: false
+        default: yalesites-project
+        type: string
       dry_run:
         description: Log what would change without writing to the board.
         required: false
@@ -74,10 +95,12 @@ jobs:
         if: steps.token.outputs.present == 'true'
         uses: actions/github-script@v7
         env:
+          ALLOWED_REPOS: ${{ inputs.allowed_repos }}
           DRY_RUN: ${{ inputs.dry_run }}
           INTERNAL_OWNER: ${{ inputs.internal_owner }}
           INTERNAL_REPO: ${{ inputs.internal_repo }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
+          PRODUCTION_REPO: ${{ inputs.production_repo }}
         with:
           github-token: ${{ secrets.PROJECT_TOKEN }}
           script: |

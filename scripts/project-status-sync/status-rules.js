@@ -84,10 +84,18 @@ function resolveTicketNumber({ headRef, title, body } = {}) {
 /**
  * Maps a pull_request event to the board status it should produce.
  *
- * @param {{action?: string, labelName?: string, merged?: boolean, baseRef?: string}} event
+ * Only the repo that cuts the platform release can mark a ticket Done. In
+ * atomic and component-library-twig, a merge to `main` is an RC promotion — an
+ * intermediate release-engineering step, not "shipped" — and the board already
+ * reflects that: every ticket carried by the 2026-08-14 component-library-twig
+ * RC (1529, 1532, 1536, 1537) still sits at "Ready for Release (in dev)".
+ * Treating those merges as Done would mark tickets shipped a week or more early.
+ *
+ * @param {{action?: string, labelName?: string, merged?: boolean, baseRef?: string,
+ *          repo?: string, productionRepo?: string}} event
  * @returns {string|null} The target status, or null when the event is not one we act on.
  */
-function resolveTargetStatus({ action, labelName, merged, baseRef } = {}) {
+function resolveTargetStatus({ action, labelName, merged, baseRef, repo, productionRepo } = {}) {
   if (action === 'labeled') {
     return (labelName || '').toLowerCase() === NEEDS_REVIEW_LABEL ? STATUS_IN_REVIEW : null;
   }
@@ -96,12 +104,34 @@ function resolveTargetStatus({ action, labelName, merged, baseRef } = {}) {
     if (baseRef === 'develop') {
       return STATUS_READY_FOR_RELEASE;
     }
-    if (baseRef === 'main' || baseRef === 'master') {
+    if ((baseRef === 'main' || baseRef === 'master') && repo === productionRepo) {
       return STATUS_DONE;
     }
   }
 
   return null;
+}
+
+/**
+ * Whether a repository is allowed to drive the YaleSites Board.
+ *
+ * This workflow lives in a public repository, so GitHub will happily let *any*
+ * repository call it. The token is the real access control — a caller without
+ * `PROJECT_TOKEN` can do nothing — but that relies on the org secret's
+ * visibility being set correctly and staying that way. This is the second lock:
+ * an explicit list of the repos whose pull requests are allowed to move tickets.
+ *
+ * @param {string} repository The caller's full `owner/repo`.
+ * @param {string} allowed Newline- or comma-separated list of allowed `owner/repo`.
+ * @returns {boolean}
+ */
+function isAllowedCaller(repository, allowed) {
+  const entries = String(allowed || '')
+    .split(/[\n,]/)
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+
+  return entries.includes(String(repository || '').trim().toLowerCase());
 }
 
 /**
@@ -179,6 +209,7 @@ module.exports = {
   STATUS_IN_REVIEW,
   STATUS_READY_FOR_RELEASE,
   extractMergedPullNumbers,
+  isAllowedCaller,
   isMissingRecordError,
   isReleasePromotion,
   resolveTargetStatus,

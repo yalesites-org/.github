@@ -6,6 +6,7 @@ const {
   STATUS_IN_REVIEW,
   STATUS_READY_FOR_RELEASE,
   extractMergedPullNumbers,
+  isAllowedCaller,
   isMissingRecordError,
   isReleasePromotion,
   resolveTargetStatus,
@@ -135,9 +136,34 @@ describe('resolveTargetStatus', () => {
     );
   });
 
-  it('moves the ticket to Done when merged to main or master', () => {
-    assert.equal(resolveTargetStatus({ action: 'closed', merged: true, baseRef: 'main' }), STATUS_DONE);
-    assert.equal(resolveTargetStatus({ action: 'closed', merged: true, baseRef: 'master' }), STATUS_DONE);
+  it('moves the ticket to Done when the platform repo merges to main or master', () => {
+    const release = {
+      action: 'closed',
+      merged: true,
+      repo: 'yalesites-project',
+      productionRepo: 'yalesites-project',
+    };
+    assert.equal(resolveTargetStatus({ ...release, baseRef: 'main' }), STATUS_DONE);
+    assert.equal(resolveTargetStatus({ ...release, baseRef: 'master' }), STATUS_DONE);
+  });
+
+  it('does NOT mark tickets Done on an atomic or component-library-twig RC promotion', () => {
+    // Verified against the board: 1529, 1532, 1536 and 1537 were all carried by
+    // the 2026-08-14 component-library-twig develop -> main RC Update, and all
+    // four still sit at "Ready for Release (in dev)". A companion RC is an
+    // intermediate release step, not "shipped".
+    for (const repo of ['atomic', 'component-library-twig']) {
+      assert.equal(
+        resolveTargetStatus({
+          action: 'closed',
+          merged: true,
+          baseRef: 'main',
+          repo,
+          productionRepo: 'yalesites-project',
+        }),
+        null,
+      );
+    }
   });
 
   it('does nothing for a PR that was closed without merging', () => {
@@ -154,6 +180,46 @@ describe('resolveTargetStatus', () => {
   it('does nothing for an unhandled action', () => {
     assert.equal(resolveTargetStatus({ action: 'opened' }), null);
     assert.equal(resolveTargetStatus({ action: 'unlabeled', labelName: 'needs review' }), null);
+  });
+});
+
+describe('isAllowedCaller', () => {
+  const allowed = [
+    'yalesites-org/yalesites-project',
+    'yalesites-org/atomic',
+    'yalesites-org/component-library-twig',
+    'yalesites-org/tokens',
+    'yalesites-org/YaleSites-Internal',
+  ].join('\n');
+
+  it('allows each YaleSites code repo', () => {
+    for (const repository of allowed.split('\n')) {
+      assert.equal(isAllowedCaller(repository, allowed), true);
+    }
+  });
+
+  it('is case-insensitive, since YaleSites-Internal is mixed case', () => {
+    assert.equal(isAllowedCaller('yalesites-org/yalesites-internal', allowed), true);
+  });
+
+  it('rejects any other repo in the organization', () => {
+    assert.equal(isAllowedCaller('yalesites-org/ysph', allowed), false);
+    assert.equal(isAllowedCaller('yalesites-org/news.yale.edu', allowed), false);
+    assert.equal(isAllowedCaller('yalesites-org/.github', allowed), false);
+  });
+
+  it('rejects a repo outside the organization that guessed the path', () => {
+    // The workflow lives in a public repo, so anyone on GitHub can call it.
+    assert.equal(isAllowedCaller('someone-else/atomic', allowed), false);
+  });
+
+  it('rejects everything when the list is empty or missing', () => {
+    assert.equal(isAllowedCaller('yalesites-org/atomic', ''), false);
+    assert.equal(isAllowedCaller('yalesites-org/atomic', undefined), false);
+  });
+
+  it('tolerates a comma-separated list and stray whitespace', () => {
+    assert.equal(isAllowedCaller('yalesites-org/atomic', ' yalesites-org/atomic , x/y '), true);
   });
 });
 

@@ -16,10 +16,35 @@ each code repo. That way there is a single place to change it.
 | --- | --- |
 | The **`needs review`** label is added | **In review** |
 | Merged into `develop` | **Ready for Release (in dev)** |
-| Merged into `main` or `master` | **Done** |
+| Merged into `main`/`master` **in yalesites-project** | **Done** |
 
 Nothing else moves a ticket. A pull request that is closed without merging, or
 merged into another feature branch (a stacked PR), is ignored.
+
+### Only yalesites-project marks a ticket Done
+
+In atomic and component-library-twig, a merge to `main` is the RC promotion — an
+intermediate release-engineering step, not "shipped" — so tickets stay at *Ready
+for Release (in dev)* until the platform release goes out. That matches what the
+board already records: every ticket carried by the 2026-08-14
+component-library-twig RC (1529, 1532, 1536, 1537) still sits at *Ready for
+Release (in dev)*. The `production_repo` input controls which repo this is.
+
+### Which repos may use this workflow
+
+This repository is public, so GitHub will let **any** repository — inside the org
+or outside it — call this workflow. Two locks keep that from mattering:
+
+1. **The token.** A caller without `PROJECT_TOKEN` warns and exits without
+   touching anything. Scope the org secret to **selected repositories**, not
+   "all repositories" — that is the primary control.
+2. **The `allowed_repos` allow list**, which defaults to the YaleSites code repos
+   (`yalesites-project`, `atomic`, `component-library-twig`, `tokens`,
+   `YaleSites-Internal`). A call from anywhere else logs a warning and stops
+   before reading or writing anything.
+
+Adding a repo means editing that default *and* sharing the secret with it. Both
+are deliberate steps, which is the point.
 
 ### It never moves a ticket backwards
 
@@ -39,11 +64,14 @@ forward-only rule stops the ticket from regressing.
 
 ### Release promotions fan out
 
-A merge into `main`/`master` from `develop`, `v2115`, or `release/*` is a release
-promotion carrying many tickets rather than one. For those the workflow walks the
-pull requests in the merge range and marks **every** linked ticket **Done**.
-A hotfix branched straight to `master` is not a promotion and is treated as a
-single ticket.
+yalesites-project ships to `master` from a release branch (`v2115`, `release/*`)
+that carries many tickets rather than one. For those the workflow walks the pull
+requests in the merge range and marks **every** linked ticket **Done**. A hotfix
+branched straight to `master` is not a promotion and is treated as a single
+ticket.
+
+Because only yalesites-project can set Done, the companion repos' `develop` →
+`main` RC Updates never reach this path.
 
 ## How a pull request is matched to a ticket
 
@@ -91,6 +119,10 @@ It must be an **organization**-level secret, shared with `yalesites-project`,
 `atomic`, and `component-library-twig`. Secrets are not inherited from this
 repository — each caller passes its own.
 
+Set the secret's visibility to **selected repositories** and pick only those.
+"All repositories" would hand it to every repo in the org, which is exactly what
+the `allowed_repos` list above is there to prevent.
+
 **Scope it as narrowly as it will go.** These three repos are public, and anyone
 with write access to a public repo can run a workflow that reads a secret
 available to it. A classic PAT with `repo` scope grants read *and write* on every
@@ -133,7 +165,11 @@ jobs:
       PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
 ```
 
-Then make sure the org secret `PROJECT_TOKEN` is shared with that repository.
+Then two more deliberate steps, both required:
+
+1. Add `yalesites-org/<repo>` to the `allowed_repos` default in
+   `.github/workflows/project-status-sync.yml`.
+2. Share the org secret `PROJECT_TOKEN` with that repository.
 
 The `if:` skips pull requests from forks, where secrets are unavailable.
 
@@ -143,6 +179,8 @@ All optional; the defaults are what YaleSites uses.
 
 | Input | Default | Purpose |
 | --- | --- | --- |
+| `allowed_repos` | the five YaleSites repos | `owner/repo` per line; anything else is refused |
+| `production_repo` | `yalesites-project` | The only repo whose merge to main/master means Done |
 | `project_number` | `6` | The YaleSites Board's Projects v2 number |
 | `internal_owner` | `yalesites-org` | Owner of the repo holding the tickets |
 | `internal_repo` | `YaleSites-Internal` | Repo holding the tickets |
